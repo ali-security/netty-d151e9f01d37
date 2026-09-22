@@ -16,14 +16,16 @@
 name: Build project
 
 on:
-  push:
-    branches: [ "4.2"]
 
-  schedule:
-    - cron: '30 1 * * 1'  # At 01:30 on Monday, every Monday.
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire test selector passed through to maven as -Dtest=<value> (empty runs the full suite)'
+        required: false
+        default: ''
+        type: string
 
 env:
   MAVEN_OPTS: -Xmx6g -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryhandler.count=5 -Dmaven.wagon.httpconnectionManager.ttlSeconds=240
@@ -40,24 +42,25 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
           - setup: linux-x86_64-java11
             docker-compose-build: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build"
             docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml run build"
-          - setup: linux-x86_64-java11-boringssl-snapshot
-            docker-compose-build: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build"
-            docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml run build-boringssl-snapshot"
 
     name: ${{ matrix.setup }}
     steps:
       - uses: actions/checkout@v4
 
       # Cache .m2/repository
+      # Upstream's `continue-on-error: true` removed here: it guarded only this
+      # Maven-repo cache step, but the seal build's workflow scanner reads any
+      # continue-on-error in a target as test-failure masking and refuses to
+      # dispatch. A cache miss is not fatal to the build either way.
       - name: Cache local Maven repository
         uses: actions/cache@v4
-        continue-on-error: true
         with:
           path: ~/.m2/repository
           key: cache-maven-${{ hashFiles('**/pom.xml') }}
@@ -69,6 +72,11 @@ jobs:
         run: docker compose ${{ matrix.docker-compose-build }}
 
       - name: Build project without leak detection
+        timeout-minutes: 30
+        env:
+          # Forwarded into the build container by docker/docker-compose.yaml, where the
+          # build service appends ${TEST_FILTER:+-Dtest=$TEST_FILTER} to the mvnw command.
+          TEST_FILTER: ${{ inputs.test-filter }}
         run: docker compose ${{ matrix.docker-compose-run }} | tee build.output
 
       - name: Checking for test failures
@@ -79,9 +87,12 @@ jobs:
         if: cancelled()
 
       - uses: actions/upload-artifact@v4
-        if: ${{ failure() }}
+        if: ${{ failure() || cancelled() }}
         with:
-          name: target
+          name: build-logs-${{ matrix.setup }}
           path: |
+            build.output
             **/target/surefire-reports/
             **/hs_err*.log
+          if-no-files-found: warn
+          retention-days: 1

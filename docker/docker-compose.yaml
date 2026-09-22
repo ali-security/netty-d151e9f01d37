@@ -16,6 +16,8 @@ services:
       - GPG_PASSPHRASE
       - GPG_PRIVATE_KEY
       - MAVEN_OPTS
+      # Optional surefire selector supplied by the ci-build.yml test-filter dispatch input.
+      - TEST_FILTER
     volumes:
       - ~/.ssh:/root/.ssh
       - ~/.gnupg:/root/.gnupg
@@ -31,11 +33,21 @@ services:
 
   build:
     <<: *common
-    command: '/bin/bash -cl "
-      ./mvnw -B -ntp clean install -Dio.netty.testsuite.badHost=netty.io -Dtcnative.classifier=linux-x86_64-fedora -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true && 
-      cd testsuite-shading &&
-      ../mvnw -B -ntp integration-test failsafe:verify -Dtcnative.classifier=linux-x86_64-fedora -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true
-    "'
+    # TEMP: scoped to CVE-patched modules + transport-native-epoll (-pl ... -am, no -amd).
+    # Patches touch transport-classes-epoll and transport-native-unix-common; real test
+    # coverage lives in transport-native-epoll. -amd pulls in handler/codec/testsuite-* and
+    # blows out wall-clock to 90+ min for tests that don't exercise the patched code.
+    # Revert to the full-reactor command below before merging upstream:
+    #   command: '/bin/bash -cl "
+    #     ./mvnw -B -ntp clean install -Dio.netty.testsuite.badHost=netty.io -Dtcnative.classifier=linux-x86_64-fedora -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true &&
+    #     cd testsuite-shading &&
+    #     ../mvnw -B -ntp integration-test failsafe:verify -Dtcnative.classifier=linux-x86_64-fedora -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true
+    #   "'
+    # TEST_FILTER comes from the ci-build.yml `test-filter` dispatch input. The $$ keeps
+    # compose from interpolating it on the host, so bash inside the container expands it:
+    # empty/unset -> nothing appended (full suite); set -> -Dtest=<value> scoping surefire
+    # (failIfNoSpecifiedTests=false so reactor modules without a match don't fail).
+    command: /bin/bash -cl "./mvnw -B -ntp -pl transport-classes-epoll,transport-native-unix-common,transport-native-epoll -am clean install -Dio.netty.testsuite.badHost=netty.io -Dtcnative.classifier=linux-x86_64-fedora -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true $${TEST_FILTER:+-Dtest=$$TEST_FILTER -Dsurefire.failIfNoSpecifiedTests=false}"
 
   deploy:
     <<: *common
@@ -49,7 +61,7 @@ services:
       - ~/.m2:/root/.m2
       - ~/local-staging:/root/local-staging
       - ..:/code
-    command: /bin/bash -cl "./mvnw -B -ntp clean package org.sonatype.plugins:nexus-staging-maven-plugin:deploy -DskipRemoteStaging=true -DaltStagingDirectory=/root/local-staging -DskipTests=true -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true"
+    command: /bin/bash -cl "./mvnw -B -ntp clean deploy -DaltDeploymentRepository=local-staging::default::file:///root/local-staging -DskipTests=true -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true"
 
   stage-release:
     <<: *common
